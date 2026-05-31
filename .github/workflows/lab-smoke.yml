@@ -1,0 +1,87 @@
+name: Azure Test Lab Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azure-test-lab-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker-smoke:
+    name: Build And Smoke Test Local Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Build local image
+        run: |
+          docker build \
+            --pull \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --tag juice-shop-lab-smoke:${GITHUB_SHA} \
+            .
+
+      - name: Run local smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p reports
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          container_name="juice-shop-lab-smoke"
+          image_name="juice-shop-lab-smoke:${GITHUB_SHA}"
+
+          docker run --rm --detach --publish 127.0.0.1:3000:3000 --name "${container_name}" "${image_name}"
+          trap 'docker logs "${container_name}" > reports/container.log 2>&1 || true; docker stop "${container_name}" > /dev/null 2>&1 || true' EXIT
+
+          ready="false"
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:3000/ > reports/home.html; then
+              ready="true"
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "${ready}" != "true" ]; then
+            echo "Juice Shop did not become ready in time." >&2
+            exit 1
+          fi
+
+          curl --fail --silent --show-error 'http://127.0.0.1:3000/rest/products/search?q=apple' > reports/product-search.json
+
+          finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > reports/lab-smoke-report.json <<JSON
+          {
+            "scenario": "juice-shop-local-smoke",
+            "startedAt": "${started_at}",
+            "finishedAt": "${finished_at}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "ref": "${GITHUB_REF_NAME}",
+            "sha": "${GITHUB_SHA}",
+            "containerBoundTo": "127.0.0.1:3000",
+            "requests": [
+              "GET /",
+              "GET /rest/products/search?q=apple"
+            ],
+            "deployment": "none",
+            "notes": "Local build and benign smoke requests only. No Azure resources or public endpoint are created."
+          }
+          JSON
+
+      - name: Upload smoke report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: azure-test-lab-juice-shop-smoke
+          path: reports/
+          if-no-files-found: error
+          retention-days: 14
